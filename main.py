@@ -7,6 +7,7 @@ from network import get_subnet, get_gateway_ip, get_mac, scan_network, get_local
 from spoofer import ARPSpoofer
 from vendor import get_device_info
 import names as namestore
+import favorites as favstore
 
 ctk.set_appearance_mode("dark")
 
@@ -159,9 +160,10 @@ class App(ctk.CTk):
         self.tree.column("mac",    width=180, anchor="w")
         self.tree.column("status", width=110, anchor="center")
 
-        self.tree.tag_configure("online", foreground="#4CAF50")
-        self.tree.tag_configure("cut",    foreground="#FF5252",
-                                           background="#1e0a0a")
+        self.tree.tag_configure("online",  foreground="#4CAF50")
+        self.tree.tag_configure("cut",     foreground="#FF5252",
+                                            background="#1e0a0a")
+        self.tree.tag_configure("offline", foreground="#555577")
 
         sb = ttk.Scrollbar(tbl, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
@@ -355,23 +357,53 @@ class App(ctk.CTk):
     # ── table ─────────────────────────────────────────────────────────────────
 
     def _refresh_table(self):
-        # remember current selection before wiping rows
         selected = self.tree.selection()
         sel_ip   = selected[0] if selected else None
 
-        query = self._search_var.get().lower().strip()
+        query       = self._search_var.get().lower().strip()
+        online_ips  = {d["ip"] for d in self._devices}
 
         for row in self.tree.get_children():
             self.tree.delete(row)
 
+        # ── favorites first (pinned at top, shown even when offline) ──
+        for fav in favstore.all_favorites():
+            emoji, vendor = get_device_info(fav["mac"], fav["hostname"])
+            custom  = namestore.get(fav["mac"])
+            name    = custom or fav.get("hostname") or vendor
+            display = f"⭐  {name}"
+
+            if query and not any(query in field for field in (
+                name.lower(), fav["ip"], fav["mac"].lower(), vendor.lower(),
+            )):
+                continue
+
+            online = fav["ip"] in online_ips
+            cut    = online and self._spoofer.is_active(fav["ip"])
+            if cut:
+                tag, stat = "cut", "✂  CUT"
+            elif online:
+                tag, stat = "online", "● Online"
+            else:
+                tag, stat = "offline", "○ Offline"
+
+            iid = fav["ip"]
+            if not self.tree.exists(iid):
+                self.tree.insert("", "end", iid=iid,
+                                 values=(display, fav["ip"], fav["mac"], stat),
+                                 tags=(tag,))
+
+        # ── remaining online devices ──
         for dev in self._devices:
+            if favstore.is_favorite(dev["mac"]):
+                continue   # already shown above
+
             emoji, vendor = get_device_info(dev["mac"], dev["hostname"])
             custom   = namestore.get(dev["mac"])
             hostname = dev.get("hostname", "")
             name     = custom or hostname or vendor
             display  = f"{emoji}  {name}"
 
-            # filter: match against name, IP, MAC, vendor (all lowercase)
             if query and not any(query in field for field in (
                 name.lower(), dev["ip"], dev["mac"].lower(), vendor.lower(),
             )):
@@ -385,7 +417,6 @@ class App(ctk.CTk):
                              values=(display, dev["ip"], dev["mac"], stat),
                              tags=(tag,))
 
-        # restore selection
         if sel_ip and self.tree.exists(sel_ip):
             self.tree.selection_set(sel_ip)
             self.tree.focus(sel_ip)
@@ -549,10 +580,15 @@ class App(ctk.CTk):
         if not dev:
             return
 
+        is_fav = favstore.is_favorite(dev["mac"])
+        fav_label = "★  Remove from Favorites" if is_fav else "⭐  Add to Favorites"
+
         menu = tk.Menu(self, tearoff=0, bg="#16213e", fg="white",
                        activebackground=ACCENT, activeforeground="white")
         menu.add_command(label="✏  Rename device",
                          command=lambda: self._rename(dev))
+        menu.add_command(label=fav_label,
+                         command=lambda: self._toggle_favorite(dev))
         menu.add_separator()
         menu.add_command(label="✂  Cut",    command=self._cut)
         menu.add_command(label="▶  Resume", command=self._resume)
@@ -572,6 +608,15 @@ class App(ctk.CTk):
             else:
                 namestore.clear(dev["mac"])
             self._refresh_table()
+
+    def _toggle_favorite(self, dev: dict):
+        if favstore.is_favorite(dev["mac"]):
+            favstore.remove(dev["mac"])
+            self._set_status(f"Removed {dev['ip']} from favorites")
+        else:
+            favstore.add(dev)
+            self._set_status(f"⭐ Added {dev['ip']} to favorites")
+        self._refresh_table()
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
