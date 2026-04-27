@@ -17,7 +17,7 @@ class ARPSpoofer:
     """
 
     def __init__(self, iface: str | None = None):
-        self._state: dict[str, dict] = {}   # ip -> {running, mode, intensity}
+        self._state: dict[str, dict] = {}   # ip -> {running, mode, intensity, token}
         self._lock  = threading.Lock()
         self._iface = iface or conf.route.route("0.0.0.0")[0]
 
@@ -27,16 +27,16 @@ class ARPSpoofer:
               gateway_ip: str, gateway_mac: str,
               mode: str = "block", intensity: int = 60) -> None:
         """Start or update the effect on a target."""
-        self._stop(target_ip)
-
         with self._lock:
-            self._state[target_ip] = {"running": True,
-                                       "mode": mode,
-                                       "intensity": intensity}
+            # Increment token so any existing thread sees it's stale and exits
+            prev_token = self._state.get(target_ip, {}).get("token", 0)
+            token = prev_token + 1
+            self._state[target_ip] = {"running": True, "mode": mode,
+                                       "intensity": intensity, "token": token}
 
         threading.Thread(
             target=self._loop,
-            args=(target_ip, target_mac, gateway_ip, gateway_mac),
+            args=(target_ip, target_mac, gateway_ip, gateway_mac, token),
             daemon=True,
         ).start()
 
@@ -57,7 +57,6 @@ class ARPSpoofer:
                 self._restore(dev["ip"], dev["mac"], gateway_ip, gateway_mac)
 
     def get_mode(self, target_ip: str) -> str:
-        """Returns current mode or 'normal' if not active."""
         s = self._state.get(target_ip)
         return s["mode"] if s and s["running"] else "normal"
 
@@ -68,11 +67,12 @@ class ARPSpoofer:
     # ── internal loop ─────────────────────────────────────────────────────────
 
     def _loop(self, target_ip: str, target_mac: str,
-              gateway_ip: str, gateway_mac: str) -> None:
+              gateway_ip: str, gateway_mac: str, my_token: int) -> None:
         while True:
             with self._lock:
                 s = self._state.get(target_ip, {})
-                if not s.get("running"):
+                # Exit if stopped OR if a newer apply() replaced us
+                if not s.get("running") or s.get("token") != my_token:
                     break
                 mode      = s["mode"]
                 intensity = s["intensity"]
@@ -91,14 +91,14 @@ class ARPSpoofer:
                 time.sleep(block_t)
 
                 with self._lock:
-                    if not self._state.get(target_ip, {}).get("running"):
+                    s = self._state.get(target_ip, {})
+                    if not s.get("running") or s.get("token") != my_token:
                         break
 
                 self._restore(target_ip, target_mac, gateway_ip, gateway_mac)
                 time.sleep(allow_t)
 
             elif mode == "limit":
-                # Poison `intensity`% of cycles → packet loss
                 if random.randint(1, 100) <= intensity:
                     self._poison(target_ip, target_mac, gateway_ip, gateway_mac)
                 else:
